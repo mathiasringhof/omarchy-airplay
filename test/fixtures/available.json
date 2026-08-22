@@ -1,0 +1,12 @@
+{
+  "status": { "ok": true, "state": "idle", "streams": [] },
+  "devices": {
+    "ok": true,
+    "state": "idle",
+    "devices": [
+      { "name": "Office", "model": "AudioAccessory6,1", "ip": "10.0.0.30", "port": 7000 },
+      { "name": "Living Room", "model": "AppleTV14,1", "ip": "10.0.0.20", "port": 7000 },
+      { "name": "Bedroom", "model": "AppleTV11,1", "ip": "10.0.0.10", "port": 7000 }
+    ]
+  }
+}

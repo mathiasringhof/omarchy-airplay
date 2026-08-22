@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "mathias.airplay",
+  "name": "AirPlay",
+  "version": "0.1.0",
+  "author": "Mathias Ringhof",
+  "license": "MIT",
+  "description": "View and control Apple TV mirroring through a running Double Take daemon.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AirPlay",
+    "description": "View Apple TVs and Double Take mirroring state.",
+    "category": "Network",
+    "aliases": [
+      "airplay",
+      "double-take"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

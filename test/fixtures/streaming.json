@@ -1,0 +1,17 @@
+{
+  "status": {
+    "ok": true,
+    "state": "streaming",
+    "streams": [
+      { "device": "Living Room", "device_ip": "10.0.0.20", "state": "streaming", "has_audio": true, "audio_muted": false }
+    ]
+  },
+  "devices": {
+    "ok": true,
+    "state": "streaming",
+    "devices": [
+      { "name": "Living Room", "model": "AppleTV14,1", "ip": "10.0.0.20", "port": 7000 },
+      { "name": "Bedroom", "model": "AppleTV11,1", "ip": "10.0.0.10", "port": 7000 }
+    ]
+  }
+}
