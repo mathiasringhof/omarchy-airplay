@@ -8,10 +8,9 @@ Scope {
 
   property bool active: false
   property var visibleModel: Model.loadingModel()
-  readonly property string socketPath: {
-    var runtimeDir = Quickshell.env("XDG_RUNTIME_DIR")
-    return runtimeDir === "" ? "/tmp/doubletake.sock" : runtimeDir + "/doubletake.sock"
-  }
+  property var verifiedModel: Model.loadingModel()
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR")
+  property string currentSocketPath: Model.socketPaths(runtimeDir)[0]
 
   property bool busy: false
   property string operation: ""
@@ -21,7 +20,7 @@ Scope {
   property string pendingCredentialKind: ""
   property var credentialRejection: null
   property string actionError: ""
-  property bool requestSent: false
+  property bool payloadWriteAttempted: false
   property string serializedRequest: ""
   property var responseHandler: null
   property int generation: 0
@@ -42,6 +41,7 @@ Scope {
     clearCredentialSecrets()
     generation++
     visibleModel = Model.loadingModel()
+    verifiedModel = Model.loadingModel()
     pendingAction = ""
     pendingTarget = ""
     pendingCredentialKind = ""
@@ -63,7 +63,7 @@ Scope {
     pendingTarget = ""
     pendingCredentialKind = ""
     credentialRejection = null
-    requestSent = false
+    payloadWriteAttempted = false
     serializedRequest = ""
     responseHandler = null
     requestTimeout.stop()
@@ -84,6 +84,10 @@ Scope {
     var refreshGeneration = generation
     request({ cmd: "status" }, function(statusRaw) {
       if (!active || generation !== refreshGeneration) return
+      if (Model.pollResponseDecision("status", queuedWork !== null) === "action") {
+        startQueuedWork()
+        return
+      }
       var status
       try {
         status = Model.parseResponse(statusRaw, "status")
@@ -91,12 +95,12 @@ Scope {
         failRefresh(error.message)
         return
       }
-      if (Model.pollResponseDecision("status", queuedWork !== null) === "action") {
-        startQueuedWork()
-        return
-      }
       request({ cmd: "devices" }, function(devicesRaw) {
         if (!active || generation !== refreshGeneration) return
+        if (Model.pollResponseDecision("devices", queuedWork !== null) === "action") {
+          startQueuedWork()
+          return
+        }
         try {
           var devices = Model.parseResponse(devicesRaw, "devices")
           var finishedAction = ""
@@ -106,6 +110,7 @@ Scope {
             pendingTarget = ""
           }
           var derived = Model.derive(status, devices, pendingAction, pendingTarget)
+          verifiedModel = derived
           var hadCredentialRejection = credentialRejection !== null
           var retainedRejection = Model.credentialRejectionAfterRefresh(credentialRejection, derived)
           if (retainedRejection !== null) {
@@ -193,8 +198,7 @@ Scope {
     if (decision !== "start" && decision !== "queue-action") return false
     pendingAction = action
     pendingTarget = target
-    actionError = ""
-    visibleModel = Model.applyPending(Model.withError(visibleModel, ""), action, target)
+    visibleModel = Model.applyPending(visibleModel, action, target)
     var work = { payload: payload, action: action, target: target }
     if (decision === "queue-action") {
       queuedWork = work
@@ -244,18 +248,37 @@ Scope {
   }
 
   function request(payload, callback) {
+    currentSocketPath = Model.socketPaths(runtimeDir)[0]
     responseHandler = callback
-    requestSent = false
+    payloadWriteAttempted = false
     serializedRequest = JSON.stringify(payload) + "\n"
     requestTimeout.restart()
     socket.connected = true
+  }
+
+  function tryFallbackSocket() {
+    var fallback = Model.fallbackSocketPath(runtimeDir, currentSocketPath, payloadWriteAttempted)
+    if (fallback === "") return false
+    payloadWriteAttempted = false
+    socket.connected = false
+    currentSocketPath = fallback
+    socket.connected = true
+    return true
+  }
+
+  function clearCurrentRequest() {
+    responseHandler = null
+    payloadWriteAttempted = false
+    serializedRequest = ""
+    requestTimeout.stop()
+    socket.connected = false
   }
 
   function finishRequest(raw) {
     if (!busy || responseHandler === null) return
     var callback = responseHandler
     responseHandler = null
-    requestSent = false
+    payloadWriteAttempted = false
     serializedRequest = ""
     requestTimeout.stop()
     socket.connected = false
@@ -264,25 +287,43 @@ Scope {
 
   function failRefresh(message) {
     clearCredentialSecrets()
-    responseHandler = null
-    requestSent = false
-    serializedRequest = ""
-    requestTimeout.stop()
-    socket.connected = false
+    clearCurrentRequest()
     busy = false
     operation = ""
     queuedWork = null
     if (active) visibleModel = Model.unavailableModel(message)
   }
 
-  function failCurrent(message) {
+  function dropQueuedCredential(failureKind) {
+    var message = Model.credentialTransportMessage(failureKind)
     clearCredentialSecrets()
-    responseHandler = null
-    requestSent = false
-    serializedRequest = ""
-    requestTimeout.stop()
-    socket.connected = false
+    clearCurrentRequest()
+    busy = false
+    operation = ""
+    queuedWork = null
+    pendingAction = ""
+    pendingTarget = ""
+    pendingCredentialKind = ""
+    credentialRejection = null
+    actionError = message
+    if (active) visibleModel = Model.withError(verifiedModel, message)
+  }
+
+  function failCurrent(failureKind) {
+    if (!busy || responseHandler === null) return
+    var completion = Model.failureCompletionDecision(operation, queuedWork)
+    if (completion === "action") {
+      clearCurrentRequest()
+      startQueuedWork()
+      return
+    }
+    if (completion === "drop-credential") {
+      dropQueuedCredential(failureKind)
+      return
+    }
+    var message = Model.failureMessage(failureKind)
     if (operation === "action") {
+      clearCurrentRequest()
       actionFailed(message, "transport")
       return
     }
@@ -304,12 +345,12 @@ Scope {
     id: requestTimeout
     interval: 5000
     repeat: false
-    onTriggered: root.failCurrent("Double Take did not respond within five seconds.")
+    onTriggered: root.failCurrent("socketTimeout")
   }
 
   Socket {
     id: socket
-    path: root.socketPath
+    path: root.currentSocketPath
     connected: false
 
     parser: SplitParser {
@@ -320,15 +361,18 @@ Scope {
     }
 
     onConnectedChanged: {
-      if (connected && root.busy && !root.requestSent) {
-        root.requestSent = true
+      if (connected && root.busy && !root.payloadWriteAttempted) {
+        root.payloadWriteAttempted = true
         write(root.serializedRequest)
         flush()
         root.serializedRequest = ""
-      } else if (!connected && root.busy && root.requestSent && root.responseHandler !== null) {
-        root.failCurrent("Double Take closed the socket without a response.")
+      } else if (!connected && root.busy && root.payloadWriteAttempted && root.responseHandler !== null) {
+        root.failCurrent("socketClosed")
       }
     }
-    onError: function(_) { root.failCurrent("The Double Take daemon is unavailable.") }
+    onError: function(_) {
+      if (root.busy && root.responseHandler !== null && root.tryFallbackSocket()) return
+      root.failCurrent("socketUnavailable")
+    }
   }
 }

@@ -24,13 +24,40 @@ function unavailableModel(message) {
   })
 }
 
+function socketPaths(runtimeDir) {
+  runtimeDir = String(runtimeDir || "")
+  if (runtimeDir === "") return ["/tmp/doubletake.sock"]
+  return [runtimeDir + "/doubletake.sock", "/tmp/doubletake.sock"]
+}
+
+function fallbackSocketPath(runtimeDir, currentPath, payloadWriteAttempted) {
+  var paths = socketPaths(runtimeDir)
+  if (payloadWriteAttempted || paths.length < 2 || currentPath !== paths[0]) return ""
+  return paths[1]
+}
+
+function failureMessage(kind) {
+  if (kind === "socketUnavailable") return "The Double Take socket is unavailable."
+  if (kind === "socketTimeout") return "Double Take did not respond within five seconds."
+  if (kind === "socketClosed") return "Double Take closed the socket without a response."
+  if (kind === "requestRejected") return "Double Take rejected the request."
+  if (kind === "malformedResponse") return "Double Take returned a malformed response."
+  if (kind === "discoveryReported") return "Double Take reported an Apple TV discovery error."
+  if (kind === "streamReported") return "Double Take reported a mirroring stream error."
+  throw new Error("Unknown sanitized failure category.")
+}
+
+function credentialTransportMessage(kind) {
+  return failureMessage(kind) + " The submitted credential was cleared. Enter it again."
+}
+
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
 }
 
-function requiredString(object, key, context) {
+function requiredString(object, key) {
   if (typeof object[key] !== "string")
-    throw new Error(context + "." + key + " must be a string")
+    throw new Error(failureMessage("malformedResponse"))
   return object[key]
 }
 
@@ -39,35 +66,36 @@ function parseResponse(raw, kind) {
   try {
     value = typeof raw === "string" ? JSON.parse(raw) : raw
   } catch (_) {
-    throw new Error("Double Take returned malformed JSON")
+    throw new Error(failureMessage("malformedResponse"))
   }
 
-  if (!isObject(value)) throw new Error("Double Take response must be an object")
-  if (typeof value.ok !== "boolean") throw new Error("Double Take response.ok must be a boolean")
+  if (!isObject(value)) throw new Error(failureMessage("malformedResponse"))
+  if (typeof value.ok !== "boolean") throw new Error(failureMessage("malformedResponse"))
   if (value.error !== undefined && typeof value.error !== "string")
-    throw new Error("Double Take response.error must be a string")
-  if (!value.ok) throw new Error(value.error || "Double Take rejected the request")
-  requiredString(value, "state", "response")
+    throw new Error(failureMessage("malformedResponse"))
+  if (!value.ok)
+    throw new Error(failureMessage(kind === "devices" ? "discoveryReported" : "requestRejected"))
+  requiredString(value, "state")
 
   if (kind === "status") {
     if (value.streams !== undefined && !Array.isArray(value.streams))
-      throw new Error("Double Take response.streams must be an array")
+      throw new Error(failureMessage("malformedResponse"))
     var streams = value.streams || []
     for (var i = 0; i < streams.length; i++) {
-      if (!isObject(streams[i])) throw new Error("stream must be an object")
-      requiredString(streams[i], "device", "stream")
-      requiredString(streams[i], "device_ip", "stream")
-      requiredString(streams[i], "state", "stream")
+      if (!isObject(streams[i])) throw new Error(failureMessage("malformedResponse"))
+      requiredString(streams[i], "device")
+      requiredString(streams[i], "device_ip")
+      requiredString(streams[i], "state")
     }
   }
 
   if (kind === "devices") {
-    if (!Array.isArray(value.devices)) throw new Error("Double Take response.devices must be an array")
+    if (!Array.isArray(value.devices)) throw new Error(failureMessage("malformedResponse"))
     for (var j = 0; j < value.devices.length; j++) {
-      if (!isObject(value.devices[j])) throw new Error("device must be an object")
-      requiredString(value.devices[j], "name", "device")
-      requiredString(value.devices[j], "model", "device")
-      requiredString(value.devices[j], "ip", "device")
+      if (!isObject(value.devices[j])) throw new Error(failureMessage("malformedResponse"))
+      requiredString(value.devices[j], "name")
+      requiredString(value.devices[j], "model")
+      requiredString(value.devices[j], "ip")
     }
   }
 
@@ -306,6 +334,11 @@ function pollResponseDecision(stage, queuedWork) {
   return stage === "status" ? "devices" : "complete"
 }
 
+function failureCompletionDecision(operation, queuedWork) {
+  if (operation !== "poll" || !queuedWork) return "fail"
+  return isCredentialWork(queuedWork) ? "drop-credential" : "action"
+}
+
 function recoverCommandError(model, commandError) {
   return {
     model: model,
@@ -315,6 +348,15 @@ function recoverCommandError(model, commandError) {
 
 function commandErrorAfterRefresh(commandError, successful) {
   return successful ? "" : String(commandError || "")
+}
+
+function responseError(status, devices) {
+  if (status.error) return failureMessage("streamReported")
+  var streams = status.streams || []
+  for (var i = 0; i < streams.length; i++)
+    if (streams[i].state === "error" || streams[i].error) return failureMessage("streamReported")
+  if (devices.error) return failureMessage("discoveryReported")
+  return ""
 }
 
 function targetedRequest(command, target) {
@@ -385,7 +427,7 @@ function derive(status, devices, pendingAction, pendingTarget) {
   mirroring.sort(compareRows)
   available.sort(compareRows)
 
-  var error = status.error || devices.error || ""
+  var error = responseError(status, devices)
   var heroStatus = mirroring.length > 1
     ? "MULTIPLE STREAMS"
     : mirroring.length === 1

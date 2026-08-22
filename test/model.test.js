@@ -466,6 +466,20 @@ test("queued work preempts the next poll stage after the current response", () =
   assert.equal(context.pollResponseDecision("devices", true), "action")
 })
 
+test("poll failures dispatch non-secret work but drop queued credentials", () => {
+  const connect = { action: "connect", payload: context.targetedRequest("connect", "10.0.0.20") }
+  const disconnect = { action: "disconnect", payload: context.targetedRequest("disconnect", "10.0.0.20") }
+  const credential = {
+    action: "credential",
+    payload: context.credentialRequest("10.0.0.20", "1234")
+  }
+  assert.equal(context.failureCompletionDecision("poll", connect), "action")
+  assert.equal(context.failureCompletionDecision("poll", disconnect), "action")
+  assert.equal(context.failureCompletionDecision("poll", credential), "drop-credential")
+  assert.equal(context.failureCompletionDecision("poll", null), "fail")
+  assert.equal(context.failureCompletionDecision("action", connect), "fail")
+})
+
 test("every completed action schedules exactly one immediate refresh", () => {
   assert.equal(context.completionDecision("action", false), "refresh")
   assert.equal(context.completionDecision("action", true), "refresh")
@@ -486,4 +500,163 @@ test("command error recovery waits for a complete successful refresh", () => {
   const recovered = context.recoverCommandError(derive("available"), error)
   assert.equal(recovered.model.error, "")
   assert.equal(recovered.nextError, "")
+})
+
+test("socket selection tries the runtime path before the legacy fallback", () => {
+  assert.deepEqual(Array.from(context.socketPaths("/run/user/1000")), [
+    "/run/user/1000/doubletake.sock",
+    "/tmp/doubletake.sock"
+  ])
+  assert.deepEqual(Array.from(context.socketPaths("")), ["/tmp/doubletake.sock"])
+  assert.equal(
+    context.fallbackSocketPath("/run/user/1000", "/run/user/1000/doubletake.sock", false),
+    "/tmp/doubletake.sock"
+  )
+  assert.equal(
+    context.fallbackSocketPath("/run/user/1000", "/run/user/1000/doubletake.sock", true),
+    ""
+  )
+  assert.equal(context.fallbackSocketPath("/run/user/1000", "/tmp/doubletake.sock", false), "")
+  assert.equal(context.fallbackSocketPath("", "/tmp/doubletake.sock", false), "")
+})
+
+test("failure categories are stable, distinguishable, and contain no daemon detail", () => {
+  const kinds = [
+    "socketUnavailable",
+    "socketTimeout",
+    "socketClosed",
+    "requestRejected",
+    "malformedResponse",
+    "discoveryReported",
+    "streamReported"
+  ]
+  const messages = kinds.map(kind => context.failureMessage(kind))
+  assert.equal(new Set(messages).size, messages.length)
+  assert.equal(messages.some(message => message.includes("1234")), false)
+  assert.throws(() => context.failureMessage("unknown"), {
+    message: "Unknown sanitized failure category."
+  })
+
+  assert.throws(
+    () => context.parseResponse({ ok: false, state: "error", error: "credential 1234 rejected" }, "action"),
+    { message: context.failureMessage("requestRejected") }
+  )
+  assert.throws(
+    () => context.parseResponse({ ok: false, state: "error", devices: [], error: "discovery secret" }, "devices"),
+    { message: context.failureMessage("discoveryReported") }
+  )
+
+  const credentialFailure = context.credentialTransportMessage("socketTimeout")
+  assert.equal(credentialFailure.startsWith(context.failureMessage("socketTimeout")), true)
+  assert.equal(credentialFailure.includes("cleared"), true)
+  assert.equal(credentialFailure.includes("1234"), false)
+})
+
+test("malformed JSON and invalid required field types are rejected safely", () => {
+  const malformed = context.failureMessage("malformedResponse")
+  const cases = [
+    ["not json", "status"],
+    [{ ok: "yes", state: "idle" }, "status"],
+    [{ ok: true, state: 7 }, "status"],
+    [{ ok: true, state: "idle", streams: {} }, "status"],
+    [{ ok: true, state: "idle", streams: [{ device: 7, device_ip: "10.0.0.1", state: "idle" }] }, "status"],
+    [{ ok: true, state: "idle" }, "devices"],
+    [{ ok: true, state: "idle", devices: [{ name: "TV", model: false, ip: "10.0.0.1" }] }, "devices"],
+    [{ ok: true, state: "idle", devices: [], error: 1234 }, "devices"]
+  ]
+  for (const [value, kind] of cases)
+    assert.throws(() => context.parseResponse(value, kind), { message: malformed })
+})
+
+test("omitted optional fields and unknown future data remain forward-compatible", () => {
+  const status = context.parseResponse({
+    ok: true,
+    state: "future_daemon_state",
+    future_top_level: { enabled: true }
+  }, "status")
+  const devices = context.parseResponse({
+    ok: true,
+    state: "future_discovery_state",
+    devices: [{
+      name: "Living Room",
+      model: "AppleTV14,1",
+      ip: "10.0.0.20",
+      future_device_field: 42
+    }],
+    future_top_level: true
+  }, "devices")
+  const model = context.derive(status, devices)
+  assert.equal(model.heroStatus, "AVAILABLE")
+  assert.equal(model.available[0].name, "Living Room")
+})
+
+test("refresh publication is atomic when the second response is malformed", () => {
+  const current = derive("available")
+  const nextStatus = {
+    ok: true,
+    state: "streaming",
+    streams: [{ device: "Living Room", device_ip: "10.0.0.20", state: "streaming" }]
+  }
+  let published = current
+  assert.throws(() => {
+    const status = context.parseResponse(nextStatus, "status")
+    const devices = context.parseResponse({ ok: true, state: "idle", devices: "invalid" }, "devices")
+    published = context.derive(status, devices)
+  }, { message: context.failureMessage("malformedResponse") })
+  assert.equal(published, current)
+  assert.equal(published.heroStatus, "AVAILABLE")
+  assert.equal(published.mirroring.length, 0)
+})
+
+test("errors persist across failed refreshes and clear only after verified recovery", () => {
+  const error = context.failureMessage("socketTimeout")
+  assert.equal(context.commandErrorAfterRefresh(error, false), error)
+  assert.equal(context.commandErrorAfterRefresh(error, true), "")
+
+  const pending = context.applyPending(
+    context.withError(derive("available"), error),
+    "connect",
+    "10.0.0.20"
+  )
+  assert.equal(pending.error, error)
+
+  const recovered = context.recoverCommandError(
+    context.derive(
+      context.parseResponse(fixture("available").status, "status"),
+      context.parseResponse(fixture("available").devices, "devices")
+    ),
+    error
+  )
+  assert.equal(recovered.model.heroStatus, "AVAILABLE")
+  assert.equal(recovered.model.error, "")
+  assert.equal(recovered.nextError, "")
+})
+
+test("Double Take stream and discovery errors are derived without exposing response values", () => {
+  const devices = fixture("available").devices
+  const streamError = context.derive(context.parseResponse({
+    ok: true,
+    state: "error",
+    error: "credential 1234 failed",
+    streams: [{
+      device: "Living Room",
+      device_ip: "10.0.0.20",
+      state: "error",
+      error: "password swordfish failed"
+    }]
+  }, "status"), context.parseResponse(devices, "devices"))
+  assert.equal(streamError.error, context.failureMessage("streamReported"))
+  assert.equal(streamError.error.includes("1234"), false)
+  assert.equal(streamError.error.includes("swordfish"), false)
+
+  const discoveryError = context.derive(
+    context.parseResponse(fixture("idle").status, "status"),
+    context.parseResponse({
+      ok: true,
+      state: "error",
+      error: "internal discovery detail",
+      devices: []
+    }, "devices")
+  )
+  assert.equal(discoveryError.error, context.failureMessage("discoveryReported"))
 })
