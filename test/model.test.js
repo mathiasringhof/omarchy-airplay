@@ -279,6 +279,8 @@ test("disconnect is read-only for unsupported or multiple streams", () => {
     streams: [{ device: "Office", device_ip: "10.0.0.30", state: "streaming" }]
   }, devices)
   assert.equal(unsupported.mirroring[0].model, "AudioAccessory6,1")
+  assert.equal(unsupported.mirroring[0].stateLabel, "UNSUPPORTED DEVICE")
+  assert.equal(unsupported.heroStatus, "UNSUPPORTED DEVICE")
   assert.equal(unsupported.mirroring[0].canDisconnect, false)
   assert.equal(context.canDisconnect(unsupported, "10.0.0.30"), false)
 
@@ -293,6 +295,159 @@ test("disconnect is read-only for unsupported or multiple streams", () => {
   assert.equal(multiple.mirroring.length, 2)
   assert.equal(multiple.mirroring.every(row => !row.canDisconnect), true)
   assert.equal(context.canDisconnect(multiple, "10.0.0.20"), false)
+})
+
+test("streams remain authoritative when discovery is missing or stale", () => {
+  const model = context.derive({
+    ok: true,
+    state: "streaming",
+    streams: [{ device: "Patio", device_ip: "10.0.0.99", state: "streaming" }]
+  }, {
+    ok: true,
+    state: "streaming",
+    devices: [
+      { name: "Bedroom", model: "AppleTV11,1", ip: "10.0.0.10" }
+    ]
+  })
+
+  assert.equal(model.heroStatus, "MIRRORING")
+  assert.deepEqual(Array.from(model.mirroring, row => [row.name, row.ip, row.model]), [
+    ["Patio", "10.0.0.99", ""]
+  ])
+  assert.deepEqual(Array.from(model.available, row => row.name), ["Bedroom"])
+  assert.equal(model.mirroring[0].canDisconnect, false)
+  assert.equal(model.available[0].canConnect, false)
+})
+
+test("a matching device enriches a stream without replacing its reported identity", () => {
+  const model = context.derive({
+    ok: true,
+    state: "streaming",
+    streams: [{ device: "Reported Name", device_ip: "10.0.0.20", state: "streaming" }]
+  }, {
+    ok: true,
+    state: "streaming",
+    devices: [
+      { name: "Discovered Name", model: "AppleTV14,1", ip: "10.0.0.20" }
+    ]
+  })
+
+  assert.equal(model.mirroring[0].name, "Reported Name")
+  assert.equal(model.mirroring[0].ip, "10.0.0.20")
+  assert.equal(model.mirroring[0].model, "AppleTV14,1")
+  assert.equal(model.mirroring[0].canDisconnect, true)
+})
+
+test("mixed and multiple stream data stays visible, sorted, and read-only", () => {
+  const model = context.derive({
+    ok: true,
+    state: "streaming",
+    streams: [
+      { device: "Zulu", device_ip: "10.0.0.30", state: "streaming" },
+      { device: "Alpha", device_ip: "10.0.0.20", state: "future_state" },
+      { device: "Alpha", device_ip: "10.0.0.10", state: "connecting" }
+    ]
+  }, {
+    ok: true,
+    state: "streaming",
+    devices: [
+      { name: "Bedroom", model: "AppleTV11,1", ip: "10.0.0.10" },
+      { name: "Living Room", model: "AppleTV14,1", ip: "10.0.0.20" },
+      { name: "Office", model: "AudioAccessory6,1", ip: "10.0.0.30" },
+      { name: "Available", model: "AppleTV14,1", ip: "10.0.0.40" }
+    ]
+  })
+
+  assert.equal(model.heroStatus, "MULTIPLE STREAMS")
+  assert.deepEqual(Array.from(model.mirroring, row => row.ip), [
+    "10.0.0.10",
+    "10.0.0.20",
+    "10.0.0.30"
+  ])
+  assert.deepEqual(Array.from(model.mirroring, row => row.stateLabel), [
+    "CONNECTING",
+    "UNKNOWN STATE",
+    "UNSUPPORTED DEVICE"
+  ])
+  assert.equal(model.mirroring.every(row => !row.canDisconnect), true)
+  assert.equal(model.available.every(row => !row.canConnect), true)
+})
+
+test("an unfamiliar lone Apple TV stream remains safely disconnectable", () => {
+  const devices = fixture("available").devices
+  const model = context.derive({
+    ok: true,
+    state: "future_state",
+    streams: [{ device: "Living Room", device_ip: "10.0.0.20", state: "future_state" }]
+  }, devices)
+
+  assert.equal(model.heroStatus, "UNKNOWN STATE")
+  assert.equal(model.mirroring[0].stateLabel, "UNKNOWN STATE")
+  assert.equal(model.available.every(row => !row.canConnect), true)
+  assert.equal(model.mirroring[0].canDisconnect, true)
+  assert.equal(context.canDisconnect(model, "10.0.0.20"), true)
+})
+
+test("hero status prioritizes multiple streams and unsupported devices", () => {
+  const devices = fixture("available").devices
+  const unsupportedPrompt = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{
+      device: "Office",
+      device_ip: "10.0.0.30",
+      state: "pin_required",
+      credential_kind: "pin"
+    }]
+  }, devices)
+  assert.equal(unsupportedPrompt.heroStatus, "UNSUPPORTED DEVICE")
+  assert.equal(unsupportedPrompt.mirroring[0].needsCredential, false)
+  assert.equal(context.canSubmitCredential(unsupportedPrompt, "10.0.0.30", "pin", "1234"), false)
+  assert.equal(context.canCancelCredential(unsupportedPrompt, "10.0.0.30"), false)
+
+  const multiple = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [
+      { device: "Office", device_ip: "10.0.0.30", state: "streaming" },
+      {
+        device: "Living Room",
+        device_ip: "10.0.0.20",
+        state: "pin_required",
+        credential_kind: "password"
+      }
+    ]
+  }, devices)
+  assert.equal(multiple.heroStatus, "MULTIPLE STREAMS")
+})
+
+test("pending overlays preserve newly authoritative multiple and unsupported states", () => {
+  const devices = fixture("available").devices
+  const multiple = context.derive({
+    ok: true,
+    state: "streaming",
+    streams: [
+      { device: "Bedroom", device_ip: "10.0.0.10", state: "streaming" },
+      { device: "Living Room", device_ip: "10.0.0.20", state: "connecting" }
+    ]
+  }, devices, "connect", "10.0.0.20")
+  assert.equal(multiple.heroStatus, "MULTIPLE STREAMS")
+  assert.equal(multiple.mirroring.every(row => !row.canDisconnect), true)
+
+  const unsupported = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{
+      device: "Office",
+      device_ip: "10.0.0.30",
+      state: "pin_required",
+      credential_kind: "pin"
+    }]
+  }, devices, "credential", "10.0.0.30")
+  assert.equal(unsupported.heroStatus, "UNSUPPORTED DEVICE")
+  assert.equal(unsupported.mirroring[0].stateLabel, "UNSUPPORTED DEVICE")
+  assert.equal(unsupported.mirroring[0].pending, false)
+  assert.equal(unsupported.mirroring[0].canDisconnect, false)
 })
 
 test("request policy serializes work, prioritizes actions, and skips overlapping polls", () => {

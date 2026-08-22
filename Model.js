@@ -197,7 +197,9 @@ function applyPending(model, action, target) {
   var available = []
   for (i = 0; i < model.mirroring.length; i++) {
     var stream = model.mirroring[i]
-    if (action === "disconnect" && stream.ip === target) {
+    if (stream.unsupported) {
+      mirroring.push(copyRow(stream, { canDisconnect: false }))
+    } else if (action === "disconnect" && stream.ip === target) {
       mirroring.push(copyRow(stream, { pending: true, canDisconnect: false, stateLabel: "DISCONNECTING" }))
     } else if (action === "credential" && stream.ip === target) {
       mirroring.push(copyRow(stream, {
@@ -229,7 +231,11 @@ function applyPending(model, action, target) {
   return emptyModel({
     loading: model.loading,
     daemonAvailable: model.daemonAvailable,
-    heroStatus: action === "connect" || action === "credential" ? "CONNECTING" : model.heroStatus,
+    heroStatus: (action === "connect" || action === "credential")
+      && model.heroStatus !== "MULTIPLE STREAMS"
+      && model.heroStatus !== "UNSUPPORTED DEVICE"
+      ? "CONNECTING"
+      : model.heroStatus,
     error: model.error,
     mirroring: mirroring,
     available: available
@@ -339,6 +345,7 @@ function derive(status, devices, pendingAction, pendingTarget) {
     var stream = streams[i]
     var match = deviceByIP[stream.device_ip]
     var supported = !!match && isAppleTV(match)
+    var unsupported = !!match && !supported
     var streamCredentialKind = credentialKind(stream)
     usedIPs[stream.device_ip] = true
     mirroring.push({
@@ -346,7 +353,9 @@ function derive(status, devices, pendingAction, pendingTarget) {
       model: match ? match.model : "",
       ip: stream.device_ip,
       state: stream.state,
-      stateLabel: streamLabel(stream.state, streamCredentialKind),
+      stateLabel: unsupported ? "UNSUPPORTED DEVICE" : streamLabel(stream.state, streamCredentialKind),
+      supported: supported,
+      unsupported: unsupported,
       needsCredential: streamCredentialKind !== "" && supported,
       credentialKind: streamCredentialKind,
       pending: false,
@@ -377,26 +386,10 @@ function derive(status, devices, pendingAction, pendingTarget) {
   available.sort(compareRows)
 
   var error = status.error || devices.error || ""
-  var hasConnecting = false
-  var hasStreamError = false
-  var hasPINRequired = false
-  var hasPasswordRequired = false
-  var hasUnknownCredentialState = false
-  for (i = 0; i < mirroring.length; i++)
-    if (mirroring[i].state === "connecting") hasConnecting = true
-    else if (mirroring[i].state === "error") hasStreamError = true
-    else if (mirroring[i].credentialKind === "password") hasPasswordRequired = true
-    else if (mirroring[i].credentialKind === "pin") hasPINRequired = true
-    else if (mirroring[i].state === "pin_required") hasUnknownCredentialState = true
   var heroStatus = mirroring.length > 1
     ? "MULTIPLE STREAMS"
-    : mirroring.length > 0
-    ? (hasPasswordRequired ? "PASSWORD REQUIRED"
-      : hasPINRequired ? "PIN REQUIRED"
-      : hasUnknownCredentialState ? "UNKNOWN STATE"
-      : hasConnecting ? "CONNECTING"
-      : hasStreamError ? "ERROR"
-      : "MIRRORING")
+    : mirroring.length === 1
+    ? mirroring[0].stateLabel
     : available.length > 0 ? "AVAILABLE"
     : "NO APPLE TVS"
 
