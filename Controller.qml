@@ -14,6 +14,11 @@ Scope {
   }
 
   property bool busy: false
+  property string operation: ""
+  property var queuedWork: null
+  property string pendingAction: ""
+  property string pendingTarget: ""
+  property string actionError: ""
   property bool requestSent: false
   property string serializedRequest: ""
   property var responseHandler: null
@@ -22,6 +27,10 @@ Scope {
   function start() {
     generation++
     visibleModel = Model.loadingModel()
+    pendingAction = ""
+    pendingTarget = ""
+    actionError = ""
+    queuedWork = null
     active = true
     refresh()
   }
@@ -30,6 +39,10 @@ Scope {
     generation++
     active = false
     busy = false
+    operation = ""
+    queuedWork = null
+    pendingAction = ""
+    pendingTarget = ""
     requestSent = false
     serializedRequest = ""
     responseHandler = null
@@ -38,10 +51,18 @@ Scope {
   }
 
   function refresh() {
-    if (!active || busy) return
+    if (!active) return
+    var decision = Model.requestDecision(busy, operation, queuedWork !== null, "poll")
+    if (decision === "coalesce-poll") return
+    if (decision !== "start") return
     busy = true
+    operation = "poll"
+    runRefresh()
+  }
+
+  function runRefresh() {
     var refreshGeneration = generation
-    request("status", function(statusRaw) {
+    request({ cmd: "status" }, function(statusRaw) {
       if (!active || generation !== refreshGeneration) return
       var status
       try {
@@ -50,12 +71,25 @@ Scope {
         failRefresh(error.message)
         return
       }
-      request("devices", function(devicesRaw) {
+      if (Model.pollResponseDecision("status", queuedWork !== null) === "action") {
+        startQueuedWork()
+        return
+      }
+      request({ cmd: "devices" }, function(devicesRaw) {
         if (!active || generation !== refreshGeneration) return
         try {
           var devices = Model.parseResponse(devicesRaw, "devices")
-          visibleModel = Model.derive(status, devices)
-          busy = false
+          if (Model.pendingFinished(pendingAction, pendingTarget, status)) {
+            pendingAction = ""
+            pendingTarget = ""
+          }
+          var recovered = Model.recoverCommandError(
+            Model.derive(status, devices, pendingAction, pendingTarget),
+            actionError
+          )
+          visibleModel = recovered.model
+          actionError = recovered.nextError
+          finishRefresh()
         } catch (error) {
           failRefresh(error.message)
         }
@@ -63,10 +97,81 @@ Scope {
     })
   }
 
-  function request(command, callback) {
+  function finishRefresh() {
+    var next = Model.completionDecision(operation, queuedWork !== null)
+    if (next === "action") {
+      startQueuedWork()
+      return
+    }
+    busy = false
+    operation = ""
+  }
+
+  function startQueuedWork() {
+    var work = queuedWork
+    queuedWork = null
+    operation = "action"
+    runAction(work)
+  }
+
+  function connect(target) {
+    if (!Model.canConnect(visibleModel, target)) return
+    scheduleAction(Model.targetedRequest("connect", target), "connect", target)
+  }
+
+  function disconnect(target) {
+    if (!Model.canDisconnect(visibleModel, target)) return
+    scheduleAction(Model.targetedRequest("disconnect", target), "disconnect", target)
+  }
+
+  function scheduleAction(payload, action, target) {
+    var decision = Model.requestDecision(busy, operation, queuedWork !== null, "action")
+    if (decision !== "start" && decision !== "queue-action") return
+    pendingAction = action
+    pendingTarget = target
+    actionError = ""
+    visibleModel = Model.applyPending(Model.withError(visibleModel, ""), action, target)
+    var work = { payload: payload, action: action, target: target }
+    if (decision === "queue-action") {
+      queuedWork = work
+      return
+    }
+    busy = true
+    operation = "action"
+    runAction(work)
+  }
+
+  function runAction(work) {
+    request(work.payload, function(raw) {
+      try {
+        Model.parseResponse(raw, "action")
+      } catch (error) {
+        actionFailed(error.message)
+        return
+      }
+      refreshAfterAction()
+    })
+  }
+
+  function actionFailed(message) {
+    actionError = String(message || "Double Take rejected the request")
+    pendingAction = ""
+    pendingTarget = ""
+    visibleModel = Model.withError(visibleModel, actionError)
+    refreshAfterAction()
+  }
+
+  function refreshAfterAction() {
+    if (!active) return
+    if (Model.completionDecision(operation, false) !== "refresh") return
+    operation = "poll"
+    runRefresh()
+  }
+
+  function request(payload, callback) {
     responseHandler = callback
     requestSent = false
-    serializedRequest = JSON.stringify({ cmd: command }) + "\n"
+    serializedRequest = JSON.stringify(payload) + "\n"
     requestTimeout.restart()
     socket.connected = true
   }
@@ -89,7 +194,21 @@ Scope {
     requestTimeout.stop()
     socket.connected = false
     busy = false
+    operation = ""
     if (active) visibleModel = Model.unavailableModel(message)
+  }
+
+  function failCurrent(message) {
+    responseHandler = null
+    requestSent = false
+    serializedRequest = ""
+    requestTimeout.stop()
+    socket.connected = false
+    if (operation === "action") {
+      actionFailed(message)
+      return
+    }
+    failRefresh(message)
   }
 
   onActiveChanged: if (!active) polling.stop()
@@ -106,7 +225,7 @@ Scope {
     id: requestTimeout
     interval: 5000
     repeat: false
-    onTriggered: root.failRefresh("Double Take did not respond within five seconds.")
+    onTriggered: root.failCurrent("Double Take did not respond within five seconds.")
   }
 
   Socket {
@@ -128,9 +247,9 @@ Scope {
         flush()
         root.serializedRequest = ""
       } else if (!connected && root.busy && root.requestSent && root.responseHandler !== null) {
-        root.failRefresh("Double Take closed the socket without a response.")
+        root.failCurrent("Double Take closed the socket without a response.")
       }
     }
-    onError: function(_) { root.failRefresh("The Double Take daemon is unavailable.") }
+    onError: function(_) { root.failCurrent("The Double Take daemon is unavailable.") }
   }
 }

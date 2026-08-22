@@ -86,10 +86,130 @@ function isAppleTV(device) {
 
 function streamLabel(state) {
   if (state === "streaming") return "MIRRORING"
+  if (state === "connecting") return "CONNECTING"
+  if (state === "error") return "ERROR"
   return "UNKNOWN STATE"
 }
 
-function derive(status, devices) {
+function copyRow(row, overrides) {
+  var result = {}
+  var key
+  for (key in row) result[key] = row[key]
+  overrides = overrides || {}
+  for (key in overrides) result[key] = overrides[key]
+  return result
+}
+
+function streamForTarget(status, target) {
+  var streams = status.streams || []
+  for (var i = 0; i < streams.length; i++)
+    if (streams[i].device_ip === target) return streams[i]
+  return null
+}
+
+function pendingFinished(action, target, status) {
+  if (!action || !target) return true
+  var found = streamForTarget(status, target) !== null
+  if (action === "connect") return found || !!status.error
+  if (action === "disconnect") return !found || !!status.error
+  return true
+}
+
+function applyPending(model, action, target) {
+  if (!action || !target) return model
+
+  var i
+  var mirroring = []
+  var available = []
+  for (i = 0; i < model.mirroring.length; i++) {
+    var stream = model.mirroring[i]
+    mirroring.push(action === "disconnect" && stream.ip === target
+      ? copyRow(stream, { pending: true, canDisconnect: false, stateLabel: "DISCONNECTING" })
+      : copyRow(stream, { canDisconnect: false }))
+  }
+  for (i = 0; i < model.available.length; i++) {
+    var tv = model.available[i]
+    if (action === "connect" && tv.ip === target) {
+      available.push(copyRow(tv, {
+        state: "connecting",
+        stateLabel: "CONNECTING",
+        pending: true,
+        canConnect: false
+      }))
+    } else {
+      available.push(copyRow(tv, { canConnect: false }))
+    }
+  }
+  mirroring.sort(compareRows)
+  return emptyModel({
+    loading: model.loading,
+    daemonAvailable: model.daemonAvailable,
+    heroStatus: action === "connect" ? "CONNECTING" : model.heroStatus,
+    error: model.error,
+    mirroring: mirroring,
+    available: available
+  })
+}
+
+function withError(model, message) {
+  return emptyModel({
+    loading: model.loading,
+    daemonAvailable: model.daemonAvailable,
+    heroStatus: model.heroStatus,
+    error: String(message || ""),
+    mirroring: model.mirroring,
+    available: model.available
+  })
+}
+
+function canConnect(model, target) {
+  if (!model || model.loading || !model.daemonAvailable || model.mirroring.length > 0) return false
+  for (var i = 0; i < model.available.length; i++)
+    if (model.available[i].ip === target && model.available[i].canConnect) return true
+  return false
+}
+
+function canDisconnect(model, target) {
+  if (!model || model.loading || !model.daemonAvailable) return false
+  for (var i = 0; i < model.mirroring.length; i++)
+    if (model.mirroring[i].ip === target && model.mirroring[i].canDisconnect) return true
+  return false
+}
+
+function requestDecision(busy, operation, queuedWork, requestedKind) {
+  if (!busy) return "start"
+  if (requestedKind === "action" && operation === "poll" && !queuedWork) return "queue-action"
+  if (requestedKind === "poll") return "coalesce-poll"
+  return "reject"
+}
+
+function completionDecision(operation, queuedWork) {
+  if (operation === "action") return "refresh"
+  if (operation === "poll" && queuedWork) return "action"
+  return "idle"
+}
+
+function pollResponseDecision(stage, queuedWork) {
+  if (queuedWork) return "action"
+  return stage === "status" ? "devices" : "complete"
+}
+
+function recoverCommandError(model, commandError) {
+  return {
+    model: model,
+    nextError: commandErrorAfterRefresh(commandError, true)
+  }
+}
+
+function commandErrorAfterRefresh(commandError, successful) {
+  return successful ? "" : String(commandError || "")
+}
+
+function targetedRequest(command, target) {
+  return { cmd: String(command), target: String(target) }
+}
+
+function derive(status, devices, pendingAction, pendingTarget) {
   var deviceByIP = {}
   var appleTVs = []
   var deviceList = devices.devices || []
@@ -104,16 +224,26 @@ function derive(status, devices) {
   var usedIPs = {}
   var mirroring = []
   var streams = status.streams || []
+  var supportedStreamCount = 0
+  for (i = 0; i < streams.length; i++) {
+    var supportedDevice = deviceByIP[streams[i].device_ip]
+    if (supportedDevice && isAppleTV(supportedDevice)) supportedStreamCount++
+  }
   for (i = 0; i < streams.length; i++) {
     var stream = streams[i]
     var match = deviceByIP[stream.device_ip]
+    var supported = !!match && isAppleTV(match)
     usedIPs[stream.device_ip] = true
     mirroring.push({
       name: stream.device,
       model: match ? match.model : "",
       ip: stream.device_ip,
       state: stream.state,
-      stateLabel: streamLabel(stream.state)
+      stateLabel: streamLabel(stream.state),
+      pending: false,
+      canConnect: false,
+      canDisconnect: streams.length === 1 && supportedStreamCount === 1 && supported,
+      actionKind: "disconnect"
     })
   }
 
@@ -125,7 +255,11 @@ function derive(status, devices) {
       model: tv.model,
       ip: tv.ip,
       state: "available",
-      stateLabel: "AVAILABLE"
+      stateLabel: "AVAILABLE",
+      pending: false,
+      canConnect: streams.length === 0 && !pendingAction,
+      canDisconnect: false,
+      actionKind: "connect"
     })
   }
 
@@ -133,14 +267,21 @@ function derive(status, devices) {
   available.sort(compareRows)
 
   var error = status.error || devices.error || ""
-  var heroStatus = mirroring.length > 0 ? "MIRRORING"
+  var hasConnecting = false
+  var hasStreamError = false
+  for (i = 0; i < mirroring.length; i++)
+    if (mirroring[i].state === "connecting") hasConnecting = true
+    else if (mirroring[i].state === "error") hasStreamError = true
+  var heroStatus = mirroring.length > 0
+    ? (hasConnecting ? "CONNECTING" : hasStreamError ? "ERROR" : "MIRRORING")
     : available.length > 0 ? "AVAILABLE"
     : "NO APPLE TVS"
 
-  return emptyModel({
+  var model = emptyModel({
     heroStatus: heroStatus,
     error: error,
     mirroring: mirroring,
     available: available
   })
+  return applyPending(model, pendingAction, pendingTarget)
 }

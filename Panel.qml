@@ -103,7 +103,7 @@ Panel {
         AppleTVSection {
           visible: root.state.mirroring.length > 0
           width: parent.width
-          title: "MIRRORING"
+          title: root.state.heroStatus === "CONNECTING" ? "CONNECTING" : "MIRRORING"
           rows: root.state.mirroring
         }
 
@@ -142,7 +142,7 @@ Panel {
       Item {
         required property var modelData
         width: parent.width
-        implicitHeight: labels.implicitHeight + Style.space(10)
+        implicitHeight: Math.max(labels.implicitHeight, actionButton.implicitHeight) + Style.space(10)
 
         Column {
           id: labels
@@ -173,13 +173,30 @@ Panel {
 
         Text {
           id: stateLabel
-          anchors.right: parent.right
+          anchors.right: actionButton.left
+          anchors.rightMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           text: modelData.stateLabel
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true
+        }
+
+        PanelActionButton {
+          id: actionButton
+          anchors.right: parent.right
+          anchors.verticalCenter: parent.verticalCenter
+          iconText: modelData.actionKind === "connect" ? "+" : "×"
+          tooltipText: modelData.actionKind === "connect" ? "Connect" : "Disconnect"
+          foreground: root.foreground
+          hoverColor: root.foreground
+          fontFamily: root.fontFamily
+          enabled: modelData.actionKind === "connect" ? modelData.canConnect : modelData.canDisconnect
+          onClicked: {
+            if (modelData.actionKind === "connect") controller.connect(modelData.ip)
+            else controller.disconnect(modelData.ip)
+          }
         }
       }
     }
