@@ -18,17 +18,34 @@ Scope {
   property var queuedWork: null
   property string pendingAction: ""
   property string pendingTarget: ""
+  property string pendingCredentialKind: ""
+  property var credentialRejection: null
   property string actionError: ""
   property bool requestSent: false
   property string serializedRequest: ""
   property var responseHandler: null
   property int generation: 0
+  property int credentialEpoch: 0
+
+  function clearCredentialSecrets() {
+    var cleared = Model.clearCredentialState({
+      credentialEpoch: credentialEpoch,
+      serializedRequest: serializedRequest,
+      queuedWork: queuedWork
+    })
+    credentialEpoch = cleared.credentialEpoch
+    serializedRequest = cleared.serializedRequest
+    queuedWork = cleared.queuedWork
+  }
 
   function start() {
+    clearCredentialSecrets()
     generation++
     visibleModel = Model.loadingModel()
     pendingAction = ""
     pendingTarget = ""
+    pendingCredentialKind = ""
+    credentialRejection = null
     actionError = ""
     queuedWork = null
     active = true
@@ -36,6 +53,7 @@ Scope {
   }
 
   function stop() {
+    clearCredentialSecrets()
     generation++
     active = false
     busy = false
@@ -43,6 +61,8 @@ Scope {
     queuedWork = null
     pendingAction = ""
     pendingTarget = ""
+    pendingCredentialKind = ""
+    credentialRejection = null
     requestSent = false
     serializedRequest = ""
     responseHandler = null
@@ -79,16 +99,26 @@ Scope {
         if (!active || generation !== refreshGeneration) return
         try {
           var devices = Model.parseResponse(devicesRaw, "devices")
+          var finishedAction = ""
           if (Model.pendingFinished(pendingAction, pendingTarget, status)) {
+            finishedAction = pendingAction
             pendingAction = ""
             pendingTarget = ""
           }
-          var recovered = Model.recoverCommandError(
-            Model.derive(status, devices, pendingAction, pendingTarget),
-            actionError
-          )
-          visibleModel = recovered.model
-          actionError = recovered.nextError
+          var derived = Model.derive(status, devices, pendingAction, pendingTarget)
+          var hadCredentialRejection = credentialRejection !== null
+          var retainedRejection = Model.credentialRejectionAfterRefresh(credentialRejection, derived)
+          if (retainedRejection !== null) {
+            credentialRejection = retainedRejection
+            actionError = retainedRejection.message
+            visibleModel = Model.withError(derived, actionError)
+          } else {
+            credentialRejection = null
+            if (finishedAction === "credential" || hadCredentialRejection) pendingCredentialKind = ""
+            var recovered = Model.recoverCommandError(derived, actionError)
+            visibleModel = recovered.model
+            actionError = recovered.nextError
+          }
           finishRefresh()
         } catch (error) {
           failRefresh(error.message)
@@ -109,6 +139,8 @@ Scope {
 
   function startQueuedWork() {
     var work = queuedWork
+    // Drop the only queued reference before serializing the request. The
+    // serialized buffer is cleared immediately after Socket.write below.
     queuedWork = null
     operation = "action"
     runAction(work)
@@ -124,9 +156,41 @@ Scope {
     scheduleAction(Model.targetedRequest("disconnect", target), "disconnect", target)
   }
 
+  function submitCredential(target, kind, value) {
+    if (!canSubmitCredential(target, kind, value)) return false
+    var payload = Model.credentialRequest(target, value)
+    clearCredentialSecrets()
+    pendingCredentialKind = kind
+    credentialRejection = null
+    return scheduleAction(payload, "credential", target)
+  }
+
+  function actionCanBeScheduled() {
+    var decision = Model.requestDecision(busy, operation, queuedWork !== null, "action")
+    return decision === "start" || decision === "queue-action"
+  }
+
+  function canSubmitCredential(target, kind, value) {
+    return actionCanBeScheduled() && Model.canSubmitCredential(visibleModel, target, kind, value)
+  }
+
+  function canCancelCredential(target) {
+    return actionCanBeScheduled() && Model.canCancelCredential(visibleModel, target)
+  }
+
+  function cancelCredential(target) {
+    if (!canCancelCredential(target)) return false
+    var payload = Model.credentialCancelRequest(visibleModel, target)
+    if (payload === null) return false
+    clearCredentialSecrets()
+    pendingCredentialKind = ""
+    credentialRejection = null
+    return scheduleAction(payload, "disconnect", target)
+  }
+
   function scheduleAction(payload, action, target) {
     var decision = Model.requestDecision(busy, operation, queuedWork !== null, "action")
-    if (decision !== "start" && decision !== "queue-action") return
+    if (decision !== "start" && decision !== "queue-action") return false
     pendingAction = action
     pendingTarget = target
     actionError = ""
@@ -134,11 +198,12 @@ Scope {
     var work = { payload: payload, action: action, target: target }
     if (decision === "queue-action") {
       queuedWork = work
-      return
+      return true
     }
     busy = true
     operation = "action"
     runAction(work)
+    return true
   }
 
   function runAction(work) {
@@ -146,17 +211,27 @@ Scope {
       try {
         Model.parseResponse(raw, "action")
       } catch (error) {
-        actionFailed(error.message)
+        actionFailed(error.message, Model.responseIsRejection(raw) ? "rejected" : "response")
         return
       }
       refreshAfterAction()
     })
   }
 
-  function actionFailed(message) {
-    actionError = String(message || "Double Take rejected the request")
+  function actionFailed(message, failureKind) {
+    var credentialAction = pendingAction === "credential"
+    var target = pendingTarget
+    if (credentialAction && failureKind === "rejected") {
+      credentialRejection = Model.newCredentialRejection(target, pendingCredentialKind)
+      actionError = credentialRejection.message
+    } else {
+      credentialRejection = null
+      actionError = String(message || "Double Take rejected the request")
+    }
     pendingAction = ""
     pendingTarget = ""
+    clearCredentialSecrets()
+    if (credentialRejection === null) pendingCredentialKind = ""
     visibleModel = Model.withError(visibleModel, actionError)
     refreshAfterAction()
   }
@@ -188,6 +263,7 @@ Scope {
   }
 
   function failRefresh(message) {
+    clearCredentialSecrets()
     responseHandler = null
     requestSent = false
     serializedRequest = ""
@@ -195,23 +271,26 @@ Scope {
     socket.connected = false
     busy = false
     operation = ""
+    queuedWork = null
     if (active) visibleModel = Model.unavailableModel(message)
   }
 
   function failCurrent(message) {
+    clearCredentialSecrets()
     responseHandler = null
     requestSent = false
     serializedRequest = ""
     requestTimeout.stop()
     socket.connected = false
     if (operation === "action") {
-      actionFailed(message)
+      actionFailed(message, "transport")
       return
     }
     failRefresh(message)
   }
 
   onActiveChanged: if (!active) polling.stop()
+  Component.onDestruction: clearCredentialSecrets()
 
   Timer {
     id: polling

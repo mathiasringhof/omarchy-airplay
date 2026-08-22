@@ -74,6 +74,16 @@ function parseResponse(raw, kind) {
   return value
 }
 
+function responseIsRejection(raw) {
+  var value
+  try {
+    value = typeof raw === "string" ? JSON.parse(raw) : raw
+  } catch (_) {
+    return false
+  }
+  return isObject(value) && value.ok === false
+}
+
 function compareRows(a, b) {
   if (a.name !== b.name) return a.name < b.name ? -1 : 1
   if (a.ip !== b.ip) return a.ip < b.ip ? -1 : 1
@@ -84,9 +94,69 @@ function isAppleTV(device) {
   return String(device.model || "").indexOf("AppleTV") === 0
 }
 
-function streamLabel(state) {
+function credentialKind(stream) {
+  if (!stream || stream.state !== "pin_required") return ""
+  if (stream.credential_kind === "pin" || stream.credential_kind === "password")
+    return stream.credential_kind
+  return ""
+}
+
+function credentialValid(kind, value) {
+  value = String(value || "")
+  if (kind === "password") return value.length > 0
+  return kind === "pin" && /^\d{4}$/.test(value)
+}
+
+function credentialRequest(target, value) {
+  return { cmd: "connect", target: String(target), pin: String(value) }
+}
+
+function isCredentialWork(work) {
+  return !!work && work.action === "credential"
+}
+
+function clearCredentialState(state) {
+  state = state || {}
+  return {
+    draft: "",
+    credentialEpoch: Number(state.credentialEpoch || 0) + 1,
+    serializedRequest: "",
+    queuedWork: isCredentialWork(state.queuedWork) ? null : (state.queuedWork || null)
+  }
+}
+
+function credentialRejectedMessage(kind) {
+  if (kind === "pin") return "The PIN was rejected. Enter a fresh PIN and select Connect."
+  if (kind === "password") return "The Password was rejected. Enter a fresh Password and select Connect."
+  return "The credential was rejected. Enter a fresh value and select Connect."
+}
+
+function newCredentialRejection(target, kind) {
+  return {
+    target: String(target),
+    kind: String(kind),
+    message: credentialRejectedMessage(kind)
+  }
+}
+
+function credentialRejectionAfterRefresh(rejection, model) {
+  if (!rejection || !model) return null
+  for (var i = 0; i < model.mirroring.length; i++) {
+    var row = model.mirroring[i]
+    if (row.ip === rejection.target && row.needsCredential && row.credentialKind === rejection.kind)
+      return rejection
+  }
+  return null
+}
+
+function streamLabel(state, kind) {
   if (state === "streaming") return "MIRRORING"
   if (state === "connecting") return "CONNECTING"
+  if (state === "pin_required") {
+    if (kind === "password") return "PASSWORD REQUIRED"
+    if (kind === "pin") return "PIN REQUIRED"
+    return "UNKNOWN STATE"
+  }
   if (state === "error") return "ERROR"
   return "UNKNOWN STATE"
 }
@@ -111,6 +181,10 @@ function pendingFinished(action, target, status) {
   if (!action || !target) return true
   var found = streamForTarget(status, target) !== null
   if (action === "connect") return found || !!status.error
+  if (action === "credential") {
+    var stream = streamForTarget(status, target)
+    return stream === null || stream.state !== "pin_required" || !!status.error
+  }
   if (action === "disconnect") return !found || !!status.error
   return true
 }
@@ -123,9 +197,20 @@ function applyPending(model, action, target) {
   var available = []
   for (i = 0; i < model.mirroring.length; i++) {
     var stream = model.mirroring[i]
-    mirroring.push(action === "disconnect" && stream.ip === target
-      ? copyRow(stream, { pending: true, canDisconnect: false, stateLabel: "DISCONNECTING" })
-      : copyRow(stream, { canDisconnect: false }))
+    if (action === "disconnect" && stream.ip === target) {
+      mirroring.push(copyRow(stream, { pending: true, canDisconnect: false, stateLabel: "DISCONNECTING" }))
+    } else if (action === "credential" && stream.ip === target) {
+      mirroring.push(copyRow(stream, {
+        state: "connecting",
+        stateLabel: "CONNECTING",
+        needsCredential: false,
+        credentialKind: "",
+        pending: true,
+        canDisconnect: false
+      }))
+    } else {
+      mirroring.push(copyRow(stream, { canDisconnect: false }))
+    }
   }
   for (i = 0; i < model.available.length; i++) {
     var tv = model.available[i]
@@ -144,7 +229,7 @@ function applyPending(model, action, target) {
   return emptyModel({
     loading: model.loading,
     daemonAvailable: model.daemonAvailable,
-    heroStatus: action === "connect" ? "CONNECTING" : model.heroStatus,
+    heroStatus: action === "connect" || action === "credential" ? "CONNECTING" : model.heroStatus,
     error: model.error,
     mirroring: mirroring,
     available: available
@@ -174,6 +259,27 @@ function canDisconnect(model, target) {
   for (var i = 0; i < model.mirroring.length; i++)
     if (model.mirroring[i].ip === target && model.mirroring[i].canDisconnect) return true
   return false
+}
+
+function canSubmitCredential(model, target, kind, value) {
+  if (!model || model.loading || !model.daemonAvailable || model.mirroring.length !== 1
+      || !credentialValid(kind, value)) return false
+  for (var i = 0; i < model.mirroring.length; i++) {
+    var row = model.mirroring[i]
+    if (row.ip === target && row.needsCredential && row.credentialKind === kind) return true
+  }
+  return false
+}
+
+function canCancelCredential(model, target) {
+  if (!model || model.loading || !model.daemonAvailable || model.mirroring.length !== 1) return false
+  for (var i = 0; i < model.mirroring.length; i++)
+    if (model.mirroring[i].ip === target && model.mirroring[i].needsCredential) return true
+  return false
+}
+
+function credentialCancelRequest(model, target) {
+  return canCancelCredential(model, target) ? targetedRequest("disconnect", target) : null
 }
 
 function requestDecision(busy, operation, queuedWork, requestedKind) {
@@ -233,16 +339,20 @@ function derive(status, devices, pendingAction, pendingTarget) {
     var stream = streams[i]
     var match = deviceByIP[stream.device_ip]
     var supported = !!match && isAppleTV(match)
+    var streamCredentialKind = credentialKind(stream)
     usedIPs[stream.device_ip] = true
     mirroring.push({
       name: stream.device,
       model: match ? match.model : "",
       ip: stream.device_ip,
       state: stream.state,
-      stateLabel: streamLabel(stream.state),
+      stateLabel: streamLabel(stream.state, streamCredentialKind),
+      needsCredential: streamCredentialKind !== "" && supported,
+      credentialKind: streamCredentialKind,
       pending: false,
       canConnect: false,
-      canDisconnect: streams.length === 1 && supportedStreamCount === 1 && supported,
+      canDisconnect: stream.state !== "pin_required"
+        && streams.length === 1 && supportedStreamCount === 1 && supported,
       actionKind: "disconnect"
     })
   }
@@ -269,11 +379,24 @@ function derive(status, devices, pendingAction, pendingTarget) {
   var error = status.error || devices.error || ""
   var hasConnecting = false
   var hasStreamError = false
+  var hasPINRequired = false
+  var hasPasswordRequired = false
+  var hasUnknownCredentialState = false
   for (i = 0; i < mirroring.length; i++)
     if (mirroring[i].state === "connecting") hasConnecting = true
     else if (mirroring[i].state === "error") hasStreamError = true
-  var heroStatus = mirroring.length > 0
-    ? (hasConnecting ? "CONNECTING" : hasStreamError ? "ERROR" : "MIRRORING")
+    else if (mirroring[i].credentialKind === "password") hasPasswordRequired = true
+    else if (mirroring[i].credentialKind === "pin") hasPINRequired = true
+    else if (mirroring[i].state === "pin_required") hasUnknownCredentialState = true
+  var heroStatus = mirroring.length > 1
+    ? "MULTIPLE STREAMS"
+    : mirroring.length > 0
+    ? (hasPasswordRequired ? "PASSWORD REQUIRED"
+      : hasPINRequired ? "PIN REQUIRED"
+      : hasUnknownCredentialState ? "UNKNOWN STATE"
+      : hasConnecting ? "CONNECTING"
+      : hasStreamError ? "ERROR"
+      : "MIRRORING")
     : available.length > 0 ? "AVAILABLE"
     : "NO APPLE TVS"
 

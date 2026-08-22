@@ -58,10 +58,148 @@ test("one ordinary stream moves its Apple TV to mirroring", () => {
   assert.deepEqual(Array.from(model.available, row => row.name), ["Bedroom"])
 })
 
-test("connecting is presented while credential states remain owned by later tickets", () => {
+test("connecting and credential requirements use explicit stream labels", () => {
   assert.equal(context.streamLabel("connecting"), "CONNECTING")
+  assert.equal(context.streamLabel("pin_required", "pin"), "PIN REQUIRED")
+  assert.equal(context.streamLabel("pin_required", "password"), "PASSWORD REQUIRED")
   assert.equal(context.streamLabel("pin_required"), "UNKNOWN STATE")
   assert.equal(context.streamLabel("future_state"), "UNKNOWN STATE")
+})
+
+test("credential forms distinguish visible four-digit PINs from masked passwords", () => {
+  assert.equal(context.credentialKind({ state: "pin_required", credential_kind: "pin" }), "pin")
+  assert.equal(context.credentialKind({ state: "pin_required", credential_kind: "password" }), "password")
+  assert.equal(context.credentialKind({ state: "pin_required" }), "")
+  assert.equal(context.credentialKind({ state: "pin_required", credential_kind: "future" }), "")
+  assert.equal(context.credentialKind({ state: "streaming", credential_kind: "password" }), "")
+
+  assert.equal(context.credentialValid("pin", "1234"), true)
+  assert.equal(context.credentialValid("pin", "123"), false)
+  assert.equal(context.credentialValid("pin", "12a4"), false)
+  assert.equal(context.credentialValid("password", "correct horse battery staple"), true)
+  assert.equal(context.credentialValid("password", ""), false)
+})
+
+test("credential submission uses targeted connect and the exact pin field", () => {
+  const request = context.credentialRequest("10.0.0.20", "1234")
+  assert.deepEqual(Object.keys(request).sort(), ["cmd", "pin", "target"])
+  assert.equal(request.cmd, "connect")
+  assert.equal(request.target, "10.0.0.20")
+  assert.equal(request.pin, "1234")
+  assert.equal(context.responseIsRejection('{"ok":false,"state":"pin_required","error":"no"}'), true)
+  assert.equal(context.responseIsRejection('{"ok":true,"state":"connecting"}'), false)
+  assert.equal(context.responseIsRejection("malformed"), false)
+})
+
+test("one waiting stream exposes the PIN or Password hero and remains targeted", () => {
+  const devices = fixture("available").devices
+  const pin = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{ device: "Bedroom", device_ip: "10.0.0.10", state: "pin_required", credential_kind: "pin" }]
+  }, devices)
+  const password = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{ device: "Living Room", device_ip: "10.0.0.20", state: "pin_required", credential_kind: "password" }]
+  }, devices)
+
+  assert.equal(pin.heroStatus, "PIN REQUIRED")
+  assert.equal(pin.mirroring[0].stateLabel, "PIN REQUIRED")
+  assert.equal(pin.mirroring[0].credentialKind, "pin")
+  assert.equal(pin.mirroring[0].needsCredential, true)
+  assert.equal(password.heroStatus, "PASSWORD REQUIRED")
+  assert.equal(password.mirroring[0].stateLabel, "PASSWORD REQUIRED")
+  assert.equal(password.mirroring[0].credentialKind, "password")
+  assert.equal(password.mirroring[0].needsCredential, true)
+})
+
+test("cancel is targeted and secret cleanup returns unreachable draft, buffer, and queued state", () => {
+  const devices = fixture("available").devices
+  const waiting = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{ device: "Living Room", device_ip: "10.0.0.20", state: "pin_required", credential_kind: "pin" }]
+  }, devices)
+  assert.deepEqual(
+    Object.assign({}, context.credentialCancelRequest(waiting, "10.0.0.20")),
+    { cmd: "disconnect", target: "10.0.0.20" }
+  )
+
+  const credentialWork = {
+    action: "credential",
+    payload: context.credentialRequest("10.0.0.20", "1234")
+  }
+  const cleared = context.clearCredentialState({
+    draft: "1234",
+    credentialEpoch: 7,
+    serializedRequest: JSON.stringify(credentialWork.payload),
+    queuedWork: credentialWork
+  })
+  assert.equal(cleared.draft, "")
+  assert.equal(cleared.credentialEpoch, 8)
+  assert.equal(cleared.serializedRequest, "")
+  assert.equal(cleared.queuedWork, null)
+})
+
+test("credential rejection remains on the waiting form until a fresh explicit targeted retry", () => {
+  const devices = fixture("available").devices
+  const waiting = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{ device: "Living Room", device_ip: "10.0.0.20", state: "pin_required", credential_kind: "pin" }]
+  }, devices)
+  const rejected = context.newCredentialRejection("10.0.0.20", "pin")
+  const retained = context.credentialRejectionAfterRefresh(rejected, waiting)
+  assert.equal(retained.message, "The PIN was rejected. Enter a fresh PIN and select Connect.")
+  assert.equal(
+    context.newCredentialRejection("10.0.0.20", "password").message,
+    "The Password was rejected. Enter a fresh Password and select Connect."
+  )
+
+  const retry = context.credentialRequest(retained.target, "5678")
+  assert.deepEqual(Object.assign({}, retry), {
+    cmd: "connect",
+    target: "10.0.0.20",
+    pin: "5678"
+  })
+  const connecting = context.applyPending(waiting, "credential", retained.target)
+  assert.equal(context.credentialRejectionAfterRefresh(retained, connecting), null)
+})
+
+test("unknown prompts and every action in a multiple-stream model are read-only", () => {
+  const devices = fixture("available").devices
+  const unknown = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{ device: "Living Room", device_ip: "10.0.0.20", state: "pin_required" }]
+  }, devices)
+  assert.equal(unknown.mirroring[0].stateLabel, "UNKNOWN STATE")
+  assert.equal(unknown.mirroring[0].needsCredential, false)
+  assert.equal(context.canDisconnect(unknown, "10.0.0.20"), false)
+
+  const multiple = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [
+      { device: "Bedroom", device_ip: "10.0.0.10", state: "pin_required", credential_kind: "pin" },
+      { device: "Living Room", device_ip: "10.0.0.20", state: "pin_required", credential_kind: "password" }
+    ]
+  }, devices)
+  assert.equal(multiple.heroStatus, "MULTIPLE STREAMS")
+  assert.equal(context.canSubmitCredential(multiple, "10.0.0.10", "pin", "1234"), false)
+  assert.equal(context.canCancelCredential(multiple, "10.0.0.10"), false)
+  assert.equal(context.canDisconnect(multiple, "10.0.0.10"), false)
+  assert.equal(context.credentialCancelRequest(multiple, "10.0.0.10"), null)
+
+  const missingDiscovery = context.derive({
+    ok: true,
+    state: "pin_required",
+    streams: [{ device: "Unknown", device_ip: "10.0.0.99", state: "pin_required", credential_kind: "pin" }]
+  }, devices)
+  assert.equal(missingDiscovery.mirroring[0].needsCredential, false)
+  assert.equal(context.canSubmitCredential(missingDiscovery, "10.0.0.99", "pin", "1234"), false)
+  assert.equal(context.canCancelCredential(missingDiscovery, "10.0.0.99"), false)
 })
 
 test("connect is enabled only for a discovered available Apple TV when no stream exists", () => {
