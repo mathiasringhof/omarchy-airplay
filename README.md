@@ -86,9 +86,7 @@ The symlink keeps the installed plugin pointed at the checkout. Ask the running 
 omarchy-shell shell rescanPlugins
 ```
 
-Rescanning is the normal workflow. If a journal warning still points to coordinates from the old source, the shell has stale QML. Run `omarchy restart shell` to load a fresh copy. This works around [Omarchy rescan bug #6981](https://github.com/basecamp/omarchy/issues/6981).
-
-You do not need to restart after every edit.
+Rescan after each edit. If a journal warning still points to coordinates from the old source, run `omarchy restart shell`. This works around [Omarchy rescan bug #6981](https://github.com/basecamp/omarchy/issues/6981). Normal edits do not need a restart.
 
 While exercising the widget, monitor QML and Double Take separately:
 
@@ -123,19 +121,13 @@ Then test discovery, targeted Connect, `MIRRORING`, and targeted Disconnect on a
 
 ### MVP1 validation record
 
-On 2026-08-22, the linked checkout found a real, previously paired Apple TV. Targeted Connect reached `MIRRORING`, and targeted Disconnect ended the stream. Double Take logged successful pair verification and streaming.
+On 2026-08-22, the linked checkout found a previously paired Apple TV. The icon, available row, targeted Connect, `MIRRORING`, and targeted Disconnect worked. Double Take logged successful pair verification and streaming.
 
-The Apple TV did not request a credential because it was already paired. No secret was entered, so this run could not test live non-disclosure. [Issue #8](https://github.com/mathiasringhof/omarchy-airplay/issues/8) tracks that work.
+The Apple TV requested no credential, so live leak checks remain open in [issue #8](https://github.com/mathiasringhof/omarchy-airplay/issues/8). Node fixtures cover both credential modes, input rules, targeted requests, cleanup, errors that do not echo daemon data, and retries.
 
-Issue #8 will check journals, process arguments, settings, plugin files, and displayed errors when an Apple TV asks for a PIN or password. Node fixtures already cover both credential modes, input rules, targeted requests, cleanup, errors that do not echo daemon data, and retries.
+The live run did not force loading, daemon-unavailable, empty, disabled-action, credential-form, unknown-stream, unsupported-stream, or multiple-stream panels. Node fixtures cover their model and action logic, not their visual presentation.
 
-The live run covered the icon, available row, targeted Connect, `MIRRORING`, and targeted Disconnect. Node fixtures cover model derivation and action rules for the other states.
-
-Loading, daemon-unavailable, empty, disabled-action, credential-form, unknown-stream, unsupported-stream, and multiple-stream presentations were not all forced during the live run. Those panel presentations remain visually unverified.
-
-The first run exposed a QML warning because available rows omitted the `needsCredential` boolean. Available rows now set it to `false`.
-
-Rescans appeared to reproduce the warning because the shell still had old QML cached. After a full shell restart on 2026-08-23, the warning was absent from the new process logs.
+The run exposed a QML warning because available rows lacked the `needsCredential` boolean. Available rows now set it to `false`. Rescans reused cached QML, but the warning disappeared after a full shell restart on 2026-08-23.
 
 ## MVP1 exclusions
 
