@@ -417,6 +417,8 @@ function derive(status, devices, pendingAction, pendingTarget) {
       ip: tv.ip,
       state: "available",
       stateLabel: "AVAILABLE",
+      needsCredential: false,
+      credentialKind: "",
       pending: false,
       canConnect: streams.length === 0 && !pendingAction,
       canDisconnect: false,

@@ -219,7 +219,7 @@ Panel {
 
         Item {
           id: credentialForm
-          visible: modelData.needsCredential
+          visible: modelData.needsCredential === true
           anchors.left: parent.left
           anchors.right: parent.right
           anchors.top: rowHeader.bottom

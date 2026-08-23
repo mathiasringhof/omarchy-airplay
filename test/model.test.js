@@ -48,6 +48,11 @@ test("available rows contain only Apple TVs and sort by name then IP", () => {
   assert.deepEqual(Array.from(model.available, row => row.name), ["Bedroom", "Living Room"])
   assert.equal(model.available[0].model, "AppleTV11,1")
   assert.equal(model.available[0].ip, "10.0.0.10")
+  for (const row of model.available) {
+    assert.equal(typeof row.needsCredential, "boolean")
+    assert.equal(row.needsCredential, false)
+    assert.equal(row.credentialKind, "")
+  }
 })
 
 test("one ordinary stream moves its Apple TV to mirroring", () => {
